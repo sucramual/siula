@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "revision": "example-revision",
+  "environment": "local",
+  "authority_ref": "example-decision",
+  "policy_id": "example-policy-v1",
+  "coordinator_id": "example-agent",
+  "actor_id": "example-agent",
+  "action_budget": 3,
+  "actions_used": 1,
+  "policy": {
+    "authority_ref": "example-decision",
+    "policy_id": "example-policy-v1",
+    "coordinator_id": "example-agent",
+    "allowed_scopes": ["package", "docs"],
+    "allowed_effects": ["local_write"]
+  },
+  "actions": [
+    {
+      "id": "shared-build",
+      "capability": "verify",
+      "scope": "package",
+      "effects": [],
+      "depends_on": [],
+      "required_evidence_kind": "build"
+    },
+    {
+      "id": "suite",
+      "capability": "verify",
+      "scope": "package",
+      "effects": [],
+      "depends_on": ["shared-build"],
+      "required_evidence_kind": "test"
+    },
+    {
+      "id": "docs",
+      "capability": "implement",
+      "scope": "docs",
+      "effects": ["local_write"],
+      "depends_on": [],
+      "required_evidence_kind": "other"
+    }
+  ],
+  "outcomes": [
+    {
+      "action_id": "shared-build",
+      "status": "succeeded",
+      "revision": "example-revision",
+      "environment": "local",
+      "evidence_refs": ["build-result"]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "build-result",
+      "kind": "build",
+      "command": "uv build",
+      "exit_code": 0,
+      "executed_at": "2026-09-28T12:00:00Z",
+      "revision": "example-revision",
+      "environment": "local",
+      "result": "passed"
+    }
+  ],
+  "criteria": [
+    {
+      "id": "passing-suite",
+      "required": true,
+      "expected_evidence_kind": "test",
+      "evidence_refs": [],
+      "unresolved": true
+    },
+    {
+      "id": "resolved-review",
+      "required": true,
+      "expected_evidence_kind": "review",
+      "evidence_refs": [],
+      "unresolved": true
+    }
+  ]
+}
