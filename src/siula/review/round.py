@@ -279,6 +279,8 @@ STATE_SCHEMA = record(
                     "condition": closed(*CONDITIONS),
                     "detail": node(str, NULL),
                     "claims": node(list, items=ident(ANY_KEY)),
+                    # the ledger entries it asked about; absent in older states and pause stops
+                    "entries": node(list, NULL, items=ident(LEDGER_ID)),
                     "answer": record({"text": TEXT, "by": TEXT, "at": ident(TIME)}, NULL),
                 }
             ),
@@ -562,16 +564,32 @@ def require_cwd_repo(store: Store) -> None:
 
 
 def require_origin_repo(store: Store) -> None:
-    """Before push: origin, as configured, must name <owner/repo>.
+    """Before push: origin, as configured, must name <owner/repo>, and so must each push URL.
 
-    git config prints the URL as written; git remote get-url would expand insteadOf rewrites and
-    hide the GitHub name.
+    git push origin sends to every remote.origin.pushurl when one is set, and to the URL only when
+    none is. git config prints the URLs as written; git remote get-url would expand insteadOf
+    rewrites and hide the GitHub name. The refusal names the repository, never the URL, which can
+    hold a token.
     """
     url = git(["config", "--get", "remote.origin.url"]).stdout.strip()
     match = GITHUB_REMOTE.search(url)
     require_checkout_of(
         store, f"{match[1]}/{match[2]}" if match else None, f"origin is {url or 'not set'}"
     )
+    push_urls = git(["config", "--get-all", "remote.origin.pushurl"])
+    if push_urls.returncode not in (0, 1):  # 1: no push URL is set
+        raise Failure(
+            f"git config could not read remote.origin.pushurl (exit {push_urls.returncode}); "
+            "nothing was pushed"
+        )
+    for push_url in push_urls.stdout.splitlines() if push_urls.returncode == 0 else []:
+        match = GITHUB_REMOTE.search(push_url.strip())
+        named = f"{match[1]}/{match[2]}" if match else "no GitHub repository"
+        if named.lower() != store.repo.lower():
+            raise Failure(
+                f"remote.origin.pushurl names {named}, not {store.repo}; git push origin would "
+                "send the fix there. Correct or remove it, then push again; nothing was pushed"
+            )
 
 
 def receipt_target(response: dict[str, Any]) -> str | None:
@@ -630,12 +648,17 @@ def halt(state: State, status: str, condition: str, detail: str) -> None:
     """Stop the run (S5): record stop-<n> with its condition, detail, open claims, and no answer.
 
     The condition is one of CONDITIONS, and the detail is shown as the resumeCondition. The
-    claims are the ones open now.
+    claims are the keys of the undecided claims open now, and ``entries`` names their ledger
+    entries. Only ``entries`` ties an answer to a claim (decided), so a later claim that cites
+    the same source is asked again. A stop with no undecided claim has no ``entries``.
     """
     assert condition in CONDITIONS, condition
-    undecided = (claim_keys(e) for e in open_decisions(state) if not decided(state, e))
-    claims = sorted(set[str]().union(*undecided))
-    stop = {"condition": condition, "detail": detail, "claims": claims, "answer": None}
+    undecided = [e for e in open_decisions(state) if not decided(state, e)]
+    claims = sorted(set[str]().union(*(claim_keys(e) for e in undecided)))
+    stop: dict[str, Any] = {"condition": condition, "detail": detail, "claims": claims}
+    if undecided:
+        stop["entries"] = [e["id"] for e in undecided]
+    stop["answer"] = None
     state["stops"][f"stop-{len(state['stops']) + 1}"] = stop
     state["status"] = status
 
@@ -1077,6 +1100,55 @@ def unlisted_ci(store: Store, head: str) -> tuple[dict[str, Any], bool]:
     return {"state": "none", "failing": []}, False
 
 
+# A completed check run with one of these conclusions passes; any other conclusion fails.
+PASSING_CONCLUSIONS = ("success", "neutral", "skipped")
+
+
+def unlisted_runs(store: Store, head: str) -> dict[str, Any] | None:
+    """With no required checks: CI from the head's check runs in REST, or None when they pass.
+
+    gh pr checks can leave out runs on the head, so ci_status reads them before it returns green.
+    GitHub's default filter returns the latest run of each check, so a passing re-run supersedes
+    a failed attempt. A bot review's run (BOT_REVIEW_CHECKS) is not CI. A run that has not
+    completed makes CI pending; a completed run whose conclusion is not in PASSING_CONCLUSIONS
+    makes CI failing and is named in ``failing``. A failed read, a malformed body or run, or a
+    total_count above the listed runs makes CI pending, never green.
+    """
+    path = f"repos/{store.repo}/commits/{head}/check-runs"
+    reason = f"the check runs of {head[:7]} could not be read"
+    unreadable = {"state": "pending", "failing": [], "reason": reason}
+    try:
+        data = gh_json(store, ["api", f"{path}?per_page=100"])
+    except Failure:
+        return unreadable
+    total = data.get("total_count") if isinstance(data, dict) else None
+    runs = data.get("check_runs") if isinstance(data, dict) else None
+    if not isinstance(total, int) or isinstance(total, bool) or not isinstance(runs, list):
+        return unreadable
+    if total > len(runs):
+        return unreadable
+    running: set[str] = set()
+    failing: set[str] = set()
+    for run in runs:
+        if not isinstance(run, dict):
+            return unreadable
+        name, status = run.get("name"), run.get("status")
+        if not isinstance(name, str) or not name or not isinstance(status, str):
+            return unreadable
+        if name in BOT_REVIEW_CHECKS:
+            continue
+        if status != "completed":
+            running.add(name)
+        elif run.get("conclusion") not in PASSING_CONCLUSIONS:
+            failing.add(name)
+    if failing:
+        return {"state": "failing", "failing": sorted(failing)}
+    if running:
+        reason = f"check runs still running: {', '.join(sorted(running))}"
+        return {"state": "pending", "failing": [], "reason": reason}
+    return None
+
+
 def ci_status(store: Store, head: str) -> tuple[dict[str, Any], bool]:
     """CI as ({state, failing}, real).
 
@@ -1085,10 +1157,14 @@ def ci_status(store: Store, head: str) -> tuple[dict[str, Any], bool]:
     (BOT_REVIEW_CHECKS) is not CI, so it is dropped from the listed checks. "No checks" (state
     none) needs positive evidence from REST (unlisted_ci). Listed checks that all pass are green
     only when every check suite with check runs has completed (D2); a suite list that cannot be
-    read is pending.
+    read is pending. With no required checks, gh pr checks can leave out runs on the head (such
+    as a workflow_dispatch run), so green also needs the head's check runs from REST to pass
+    (unlisted_runs); a run that has not completed is pending, a failed run is failing, and a read
+    that is not complete is pending.
     """
     fields = ["--json", "name,bucket"]
-    checks = ci_checks(store, [*fields, "--required"]) or ci_checks(store, fields)
+    required = ci_checks(store, [*fields, "--required"])
+    checks = required or ci_checks(store, fields)
     if not checks:
         return unlisted_ci(store, head)
     failing = [check.get("name") for check in checks if check.get("bucket") in ("fail", "cancel")]
@@ -1104,6 +1180,10 @@ def ci_status(store: Store, head: str) -> tuple[dict[str, Any], bool]:
     if running:
         reason = f"check suites still running: {', '.join(running)}"
         return {"state": "pending", "failing": [], "reason": reason}, True
+    if not required:  # every check counts, and gh pr checks may not list every run
+        unlisted = unlisted_runs(store, head)
+        if unlisted is not None:
+            return unlisted, True
     return {"state": "green", "failing": []}, True
 
 
@@ -1134,12 +1214,17 @@ def open_decisions(state: State) -> list[dict[str, Any]]:
 
 
 def decided(state: State, entry: dict[str, Any]) -> bool:
-    """S5: a claim is decided only by an answered stop that listed it and asked for a decision."""
-    keys = claim_keys(entry)
-    stops = state["stops"].values()
+    """S5: a claim is decided only by an answered stop that listed it and asked for a decision.
+
+    The stop must list the claim's own ledger entry in ``entries``. A shared source key is not
+    enough: a new claim that cites a decided comment gets its own question. A stop from an older
+    state has no ``entries``, so it decides nothing and the claim is asked again.
+    """
     return any(
-        s["answer"] is not None and s["condition"] in ANSWERING and keys & set(s["claims"])
-        for s in stops
+        s["answer"] is not None
+        and s["condition"] in ANSWERING
+        and entry["id"] in (s.get("entries") or [])
+        for s in state["stops"].values()
     )
 
 
@@ -2139,12 +2224,12 @@ def cmd_resume(args: argparse.Namespace, store: Store) -> dict[str, Any]:
     stop = state["stops"][sid]
     # Only the open stop gets the answer.
     stop["answer"] = decision = {"text": args.decision, "by": args.by, "at": now()}
-    # T1: an answer to a decision stop sends its claims back to the inbox with it, so triage
-    # applies it.
-    claims = set(stop["claims"]) if stop["condition"] in ANSWERING else set()
+    # T1: an answer to a decision stop sends the claims of the ledger entries it listed back to
+    # the inbox with it, so triage applies it.
+    listed = set(stop.get("entries") or []) if stop["condition"] in ANSWERING else set()
     in_inbox = inbox_keys(state)
     for entry in open_decisions(state):
-        if claim_keys(entry) & claims and f"ledger:{entry['id']}" not in in_inbox:
+        if entry["id"] in listed and f"ledger:{entry['id']}" not in in_inbox:
             # Q3: the proposal its stop was asked with, as a copy.
             proposal = state["proposals"].get(entry.get("proposal") or "")
             offered = {**proposal, "options": {**proposal["options"]}} if proposal else None

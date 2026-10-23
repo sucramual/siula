@@ -237,7 +237,11 @@ REVIEWERS = {REPO: {"login": CODEX, "doneReaction": "+1", "retrigger": "@codex r
 
 GITHUB_URL = f"https://github.com/{REPO}.git"
 CWD_CHECK = json.dumps(["repo", "view", "--json", "nameWithOwner"])
-CHECKOUT_READS = ("config --get remote.origin.url", "status --porcelain")
+CHECKOUT_READS = (
+    "config --get remote.origin.url",
+    "config --get-all remote.origin.pushurl",
+    "status --porcelain",
+)
 FAKE_GIT = (
     'if [[ -n "${FAKE_CTL:-}" ]]; then printf "%s\\n" "$*" >>"$FAKE_CTL/git.log"; fi\n'
     'exec {git} "$@"\n'
@@ -510,9 +514,9 @@ class Round:
     def calls(self) -> tuple[list, list, list]:
         """The logged gh calls, comment posts, and git calls; a comment post is also a gh call.
 
-        The read-only checkout checks (``gh repo view`` before post; the origin URL and
-        ``status --porcelain`` before push) are left out, so "nothing ran" means nothing after
-        them.
+        The read-only checkout checks (``gh repo view`` before post; the origin URL, the origin
+        push URLs, and ``status --porcelain`` before push) are left out, so "nothing ran" means
+        nothing after them.
         """
         logs = (self.ctl / "gh.log", self.ctl / "posts.log", self.ctl / "git.log")
         gh, posts, git = (log.read_text().splitlines() if log.exists() else [] for log in logs)
@@ -1403,6 +1407,142 @@ def test_T1_without_required_checks_every_check_on_the_head_counts(
     result = h.ok("sync")
 
     assert (result["next"], result["ci"], result["gaps"]) == (expected, ci, [])
+
+
+# Check-run conclusions that fail; only success, neutral, and skipped pass a completed run.
+FAILING_CONCLUSIONS = [
+    "failure",
+    "cancelled",
+    "timed_out",
+    "action_required",
+    "stale",
+    "startup_failure",
+]
+
+
+@pytest.mark.parametrize("conclusion", FAILING_CONCLUSIONS)
+def test_T1_an_unlisted_failing_check_run_is_never_green_without_required_checks(
+    make, conclusion: str
+):
+    """T1: with no required checks, a completed check run on the head that gh pr checks does not
+    list still counts. A conclusion other than success, neutral, or skipped makes CI failing and
+    names the run, so sync never reaches done.
+
+    Bug (found in review, 2026-10-23): with no required checks, CI was every check that gh pr
+    checks listed, and gh omits some runs on the head, such as a workflow_dispatch run. A
+    completed, failing, unlisted run read as green, so sync returned done with
+    ready_for_human_merge, and reviewer mode allowed APPROVE.
+    """
+    h = synced(make, COVERED)
+    h.set_checks(None, PASS)
+    failed = {**check_run("e2e", "completed"), "conclusion": conclusion}
+    h.set_rest_checks([check_run("checks", "completed"), failed], 0)
+
+    result = h.ok("sync")
+
+    head = result["head"]
+    assert (result["next"], result["ci"]) == (
+        "triage",
+        {"state": "failing", "failing": ["e2e"]},
+    ), result
+    assert [item["key"] for item in result["newItems"]] == [f"check:{head}:e2e"]
+
+
+def test_T1_an_unlisted_running_check_run_keeps_ci_pending_without_required_checks(make):
+    """T1: with no required checks, an unlisted check run on the head that has not completed keeps
+    CI pending.
+
+    Bug (found in review, 2026-10-23): CI was green from the listed checks alone, so done came
+    while an unlisted run on the head was still running.
+    """
+    h = synced(make, COVERED)
+    h.set_checks(None, PASS)
+    h.set_rest_checks([check_run("checks", "completed"), check_run("e2e", "in_progress")], 0)
+
+    result = h.ok("sync")
+
+    reason = "check runs still running: e2e"
+    assert (result["next"], result["ci"]) == (
+        "wait_ci",
+        {"state": "pending", "failing": [], "reason": reason},
+    ), result
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        {**check_run("e2e", "completed"), "conclusion": "neutral"},
+        {**check_run("e2e", "completed"), "conclusion": "skipped"},
+        check_run("e2e", "completed"),
+        {**check_run(COPILOT, "completed"), "conclusion": "failure"},
+    ],
+    ids=["neutral", "skipped", "success", "bot-review-failure"],
+)
+def test_T1_unlisted_runs_that_pass_or_belong_to_a_bot_review_leave_ci_green(make, run: dict):
+    """T1: with no required checks, an unlisted run that completed with success, neutral, or skipped
+    does not hold CI, and a bot review's run (BOT_REVIEW_CHECKS) is not CI.
+
+    Bug: the check-run read made every unlisted run block done, so a head whose runs all passed, or
+    whose only red run was Copilot's review, never became green.
+    """
+    h = synced(make, COVERED)
+    h.set_checks(None, PASS)
+    h.set_rest_checks([check_run("checks", "completed"), run], 0)
+
+    result = h.ok("sync")
+
+    assert (result["next"], result["ci"]) == ("done", {"state": "green", "failing": []}), result
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        {"fail": True},
+        {"raw": "{not json"},
+        {"body": {"check_runs": [check_run("checks", "completed")]}},
+        {"body": {"total_count": 1, "check_runs": {"name": "checks"}}},
+        {"body": {"total_count": 101, "check_runs": [check_run("checks", "completed")]}},
+        {"body": {"total_count": 1, "check_runs": [{"status": "completed"}]}},
+    ],
+    ids=[
+        "call-fails",
+        "bad-json",
+        "no-total-count",
+        "runs-not-a-list",
+        "more-runs-than-listed",
+        "run-without-a-name",
+    ],
+)
+def test_T1_unreadable_check_runs_are_never_green_without_required_checks(make, runs: dict):
+    """T1: with no required checks, when the head's check runs cannot be read in full, CI is
+    pending, never green, and T4 bounds the wait.
+
+    Bug (found in review, 2026-10-23): a failed or partial check-run read would leave the listed
+    checks as the only evidence, so done could pass a failing run that gh pr checks did not list.
+    """
+    h = synced(make, COVERED)
+    h.set_checks(None, PASS)
+    if "raw" in runs:
+        (h.ctl / "rest_check_runs.json").write_text(runs["raw"])
+    else:
+        h.set_rest_checks(None if runs.get("fail") else runs["body"], 0)
+
+    first = h.ok("sync")
+    h.advance(1800)
+    last = h.ok("sync")
+
+    head7 = first["head"][:7]
+    reason = f"the check runs of {head7} could not be read"
+    assert (first["next"], first["ci"]) == (
+        "wait_ci",
+        {"state": "pending", "failing": [], "reason": reason},
+    ), first
+    condition = f"CI still pending on {head7} after 30 minutes"
+    assert (last["next"], last["resumeCondition"], h.state()["status"]) == (
+        "needs_input",
+        condition,
+        "needs_input",
+    )
 
 
 @pytest.mark.parametrize(
@@ -2440,6 +2580,88 @@ def test_S5_an_answer_to_another_stop_decides_no_claim(make):
     )
 
 
+def test_S5_an_answer_decides_only_the_ledger_entries_its_stop_listed(make):
+    """S5 (Q3): an answered decision stop decides only the ledger entries it listed. A later Needs
+    decision claim on the same comment, with its own proposal, gets its own stop and its own answer.
+
+    Bug (found in review, 2026-10-23): decided() matched a stop to a claim by source keys. After L6
+    (proposal P1) was decided and settled, a new Needs decision claim with proposal P2 that cited
+    the same issue comment read as decided by the old answer, so sync asked the agent to apply a
+    decision that the owner never gave for P2.
+    """
+    h = synced(make, COVERED)
+    h.triage([DESIGN, PROPOSAL])
+    assert h.ok("sync")["resumeCondition"] == "decision owed on L6"
+    h.ok("resume", "--decision", "A")
+    assert [item["key"] for item in h.ok("sync")["newItems"]] == ["ledger:L6"]
+    h.triage([{**NOT_FIXED, "sameAs": "L6"}])
+    h.advance(60)
+    late = h.add_comment("Should the cursor be public too?", author="monalisa")
+    assert [item["key"] for item in h.ok("sync")["newItems"]] == [f"issue:{late}"]
+    sources = [f"issue:{late}", "issue:6095816171"]
+    second = {**DESIGN, "claim": "Make the cursor public", "sources": sources}
+    summary = "Root: who may read the cursor."
+    h.triage([second, {"proposal": {**PROPOSAL["proposal"], "summary": summary}}])
+
+    owed = h.ok("sync")
+
+    state = h.state()
+    assert [(e["id"], e["disposition"], e["proposal"]) for e in state["ledger"][5:]] == [
+        ("L6", "Needs decision", "P1"),
+        ("L7", "No change", None),
+        ("L8", "Needs decision", "P2"),
+    ]
+    assert (owed["next"], owed["reason"], owed.get("resumeCondition")) == (
+        "needs_input",
+        "decision owed on L8",
+        "decision owed on L8",
+    )
+    stop = state["stops"]["stop-2"]
+    assert (stop["condition"], stop["claims"], stop["entries"], stop["answer"]) == (
+        "decision_owed",
+        sorted(sources),
+        ["L8"],
+        None,
+    )
+    h.ok("resume", "--decision", "B")
+    [item] = h.ok("sync")["newItems"]
+    assert (item["key"], item["proposal"]["summary"]) == ("ledger:L8", summary), (
+        "the answer reopens the claim it was asked about, with its proposal"
+    )
+
+
+def test_S5_a_decision_stop_without_entries_decides_nothing_and_asks_again(make):
+    """S5: a decision stop written before stops named their ledger entries still loads, but its
+    answer decides no claim. The claim is asked again in a new stop that names it, so the run
+    fails safe.
+
+    Bug guarded: an old stop names only source keys, which a later claim on the same comment can
+    share, so reading its answer as a decision could decide a claim that nobody asked about.
+    """
+    h = synced(make, COVERED)
+    h.triage([DESIGN, PROPOSAL])
+    assert h.ok("sync")["resumeCondition"] == "decision owed on L6"
+    old = h.state()
+    del old["stops"]["stop-1"]["entries"]
+    h.state_file.write_text(json.dumps(old))
+    h.ok("resume", "--decision", "A")
+
+    again = h.ok("sync")
+
+    assert (again["next"], again["resumeCondition"], again["newItems"]) == (
+        "needs_input",
+        "decision owed on L6",
+        [],
+    )
+    stops = h.state()["stops"]
+    assert [
+        (sid, stop["condition"], stop.get("entries"), stop["answer"] is None)
+        for sid, stop in stops.items()
+    ] == [("stop-1", "decision_owed", None, False), ("stop-2", "decision_owed", ["L6"], True)]
+    h.ok("resume", "--decision", "A")
+    assert [item["key"] for item in h.ok("sync")["newItems"]] == ["ledger:L6"]
+
+
 def test_S5_a_resume_answers_only_the_open_stop(make):
     """S5: each resume writes one answer, into the stop that is open; older answers stay.
 
@@ -2509,6 +2731,7 @@ def full_state(h: Round) -> dict:
         "condition": "pause",
         "detail": "x",
         "claims": ["thread:11"],
+        "entries": ["L1"],
         "answer": {"text": "go", "by": "M", "at": at},
     }
     pending = {"kind": "thread", "target": 11, "at": at, "bodySha256": "0" * 64, "resumedAt": at}
@@ -2591,6 +2814,8 @@ SCHEMA_TABLE = [
     (("stops", "stop-1", "detail"), "stop-1 detail", NOT_TEXT_OR_NULL),
     (("stops", "stop-1", "claims"), "stop-1 claims", NOT_LIST),
     (("stops", "stop-1", "claims", 0), "stop-1 claims[0]", NOT_ID),
+    (("stops", "stop-1", "entries"), "stop-1 entries", NOT_LIST_OR_NULL),
+    (("stops", "stop-1", "entries", 0), "stop-1 entries[0]", NOT_ID),
     (("stops", "stop-1", "answer"), "stop-1 answer", NOT_RECORD_OR_NULL),
     (("stops", "stop-1", "answer", "text"), "stop-1 answer.text", NOT_TEXT),
     (("stops", "stop-1", "answer", "by"), "stop-1 answer.by", NOT_TEXT),
@@ -3402,6 +3627,103 @@ def test_push_refuses_unless_it_fast_forwards_the_rounds_head(make, case: str):
     assert f"ERROR: {error}" in result.stderr
     assert h.origin_head() == origin_before, "no push should run"
     assert h.state_file.read_bytes() == state_before, "a refused push records nothing"
+
+
+def push_urls(h: Round, work: Path, urls: list[str], target: Path) -> None:
+    """Set remote.origin.pushurl to ``urls``, as written. insteadOf sends each URL other than
+    GITHUB_URL (which pr_branch already sends to the local origin) to the local bare repository
+    ``target``, so no push leaves the machine.
+    """
+    for url in urls:
+        h.isolated.git(work, "config", "--add", "remote.origin.pushurl", url)
+        if url != GITHUB_URL:
+            h.isolated.git(work, "config", "--add", f"url.{target}.insteadOf", url)
+
+
+@pytest.mark.parametrize(
+    ("urls", "named"),
+    [
+        (["git@github.com:octo-cat/hello-world.git"], "octo-cat/hello-world"),
+        ([GITHUB_URL, "https://github.com/octo-cat/hello-world.git"], "octo-cat/hello-world"),
+        (["https://git.example.com/octo-org/hello-world.git"], "no GitHub repository"),
+    ],
+    ids=["a-git-fork", "one-of-two-push-urls", "not-github"],
+)
+def test_S6_push_refuses_a_push_url_that_names_another_repository(
+    make, urls: list[str], named: str
+):
+    """S6: git push origin sends to every remote.origin.pushurl, so push refuses unless each one,
+    as written, names <owner/repo>. It refuses before any fetch or push and records nothing.
+
+    Bug: push checked only remote.origin.url. With a push URL to a Git fork, git push sent the fix
+    there, push recorded the Fix receipt and the new head, and the next sync read the unchanged PR
+    head; nothing checked that the fix landed, so the run could reach done.
+    """
+    h = make(COVERED)
+    work = h.synced_branch()
+    h.triage([FIX])
+    fork = h.root / "fork.git"
+    h.isolated.git(h.root, "init", "-q", "--bare", str(fork))
+    push_urls(h, work, urls, fork)
+    new_head = h.commit(work, "fix: guard the cursor")
+    base = h.state()["head"]
+    entry = h.state()["ledger"][-1]
+    assert (entry["disposition"], entry["head"], entry.get("pushed")) == ("Fix", base, None)
+    before, state_before, origin_before = h.calls(), h.state_file.read_bytes(), h.origin_head()
+
+    result = h.run("push", cwd=work)
+
+    error = (
+        f"remote.origin.pushurl names {named}, not {REPO}; git push origin would send the fix "
+        "there. Correct or remove it, then push again; nothing was pushed"
+    )
+    assert (result.returncode, result.stdout) == (1, ""), result.stderr
+    assert f"ERROR: {error}" in result.stderr, result.stderr
+    git_after = h.calls()[2][len(before[2]) :]
+    assert not any(" push " in f" {call} " for call in git_after), git_after
+    assert h.calls() == before, "no fetch or push ran after the checkout checks"
+    assert h.origin_head() == origin_before
+    forked = h.isolated.git(fork, "for-each-ref", "--format=%(refname)")
+    assert forked == "", "nothing reached the fork"
+    state = h.state()
+    assert state["ledger"][-1]["id"] == entry["id"]
+    assert state["ledger"][-1].get("pushed") is None, "no push receipt"
+    assert (state["head"], new_head in state["heads"]) == (base, False), "no new head"
+    assert h.state_file.read_bytes() == state_before
+
+
+@pytest.mark.parametrize(
+    "urls",
+    [
+        [GITHUB_URL],
+        ["git@github.com:octo-org/hello-world.git"],
+        ["https://github.com/Octo-Org/Hello-World/", GITHUB_URL],
+    ],
+    ids=["the-same-url", "ssh-form", "two-urls-one-in-other-case"],
+)
+def test_S6_push_goes_ahead_when_each_push_url_names_the_prs_repository(make, urls: list[str]):
+    """S6: a push URL that names <owner/repo> (compared without case) does not change push.
+
+    Bug: a push URL check that compares the URL text, or refuses any push URL, stops a push that
+    goes to the PR's own repository.
+    """
+    h = make(COVERED)
+    work = h.synced_branch()
+    h.triage([FIX])
+    push_urls(h, work, urls, h.root / "origin.git")
+    new_head = h.commit(work, "fix: guard the cursor")
+    h.advance(60)
+    pushed_at = h.now
+
+    assert h.ok("push", cwd=work) == {"head": new_head, "pushedAt": pushed_at}
+
+    assert h.origin_head() == new_head
+    state = h.state()
+    assert (state["ledger"][-1]["disposition"], state["ledger"][-1].get("pushed")) == (
+        "Fix",
+        new_head,
+    )
+    assert state["heads"][new_head] == {"firstSeen": pushed_at, "source": "pushed"}
 
 
 # --- Reviewer mode: R1 no replies or pushes, R2 who may review, R3 one review per head, R4 approval
