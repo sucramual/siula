@@ -22,13 +22,16 @@ TEST_NAMES = (
 )
 
 # Markers that skip, focus, or expect failure. The lookbehind keeps calls such as model.fit( out.
+# It also matches pytest marks without "@" and chains such as test.describe.parallel.only(.
 MARKER = re.compile(
-    r"@pytest\.mark\.(?:skip|skipif|xfail)\b"
+    r"@?\bpytest\.mark\.(?:skip|skipif|xfail)\b"
     r"|\bpytest\.(?:skip|xfail|importorskip)\("
     r"|@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b"
     r"|\.skipTest\("
     r"|\braise\s+(?:unittest\.)?SkipTest\b"
-    r"|(?<![\w.$])(?:it|test|describe|context|suite)\.(?:skip|only|todo|fixme|skipIf|runIf)\b"
+    r"|(?<![\w.$])(?:it|test|describe|context|suite)"
+    r"(?:\.(?:concurrent|sequential|describe|parallel|serial)){0,2}"
+    r"\.(?:skip|only|todo|fixme|skipIf|runIf)\b"
     r"|(?<![\w.$])(?:xit|xtest|xdescribe|xcontext|fit|fdescribe|fcontext)\s*\("
     r"|\b[tb]\.Skip(?:f|Now)?\("
     r"|#\[ignore\b"

@@ -9,6 +9,12 @@ from siula.review.test_integrity import MARKER, is_test_file
         pytest.param('@pytest.mark.skip(reason="needs a sandbox")', id="pytest-skip-mark"),
         pytest.param("@pytest.mark.skipif(sys.platform == 'win32')", id="pytest-skipif-mark"),
         pytest.param("@pytest.mark.xfail", id="pytest-xfail-mark"),
+        pytest.param('pytestmark = pytest.mark.skip(reason="later")', id="pytestmark-skip"),
+        pytest.param("pytestmark = [pytest.mark.xfail]", id="pytestmark-list-xfail"),
+        pytest.param("pytestmark = pytest.mark.skipif(CI, reason='x')", id="pytestmark-skipif"),
+        pytest.param(
+            'pytest.param(1, marks=pytest.mark.xfail(reason="x"))', id="pytest-param-marks-xfail"
+        ),
         pytest.param('pytest.xfail("later")', id="pytest-xfail-call"),
         pytest.param('pytest.skip("no docker")', id="pytest-skip-call"),
         pytest.param('np = pytest.importorskip("numpy")', id="pytest-importorskip"),
@@ -19,6 +25,19 @@ from siula.review.test_integrity import MARKER, is_test_file
         pytest.param('it.only("adds", () => {', id="jest-it-only"),
         pytest.param('describe.skip("app", () => {});', id="jest-describe-skip"),
         pytest.param('test.todo("subtracts");', id="jest-test-todo"),
+        pytest.param('test.concurrent.skip("adds", fn);', id="jest-test-concurrent-skip"),
+        pytest.param('it.concurrent.only("adds", fn);', id="jest-it-concurrent-only"),
+        pytest.param('describe.concurrent.skip("app", fn);', id="vitest-describe-concurrent-skip"),
+        pytest.param('describe.sequential.only("app", fn);', id="vitest-describe-sequential-only"),
+        pytest.param('test.describe.only("group", fn);', id="playwright-describe-only"),
+        pytest.param('test.describe.skip("group", fn);', id="playwright-describe-skip"),
+        pytest.param('test.describe.fixme("group", fn);', id="playwright-describe-fixme"),
+        pytest.param(
+            'test.describe.parallel.only("group", fn);', id="playwright-describe-parallel-only"
+        ),
+        pytest.param(
+            'test.describe.serial.skip("group", fn);', id="playwright-describe-serial-skip"
+        ),
         pytest.param('xit("adds", () => {});', id="jasmine-xit"),
         pytest.param('fdescribe("app", () => {});', id="jasmine-fdescribe"),
         pytest.param('fit("adds", () => {});', id="jasmine-fit"),
@@ -45,10 +64,29 @@ def test_marker_matches_skip_focus_and_expected_failure(text: str):
         pytest.param('describe("only the id", () => {});', id="only-in-a-name"),
         pytest.param("assert result.skipped == 0", id="skipped-count"),
         pytest.param("def test_skip_reason_is_kept():", id="test-name-with-skip"),
+        pytest.param('@pytest.mark.parametrize("x", [1])', id="pytest-parametrize"),
+        pytest.param('test.concurrent("adds", fn);', id="jest-concurrent-without-marker"),
+        pytest.param(
+            'test.describe.configure({ mode: "serial" });', id="playwright-describe-configure"
+        ),
+        pytest.param('test.describe("group", fn);', id="playwright-describe"),
     ],
 )
 def test_marker_does_not_match_ordinary_code(text: str):
     assert MARKER.search(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param('@pytest.mark.skip(reason="later")', id="decorator"),
+        pytest.param('pytestmark = pytest.mark.skip(reason="later")', id="without-at"),
+        pytest.param('test.describe.parallel.only("group", fn);', id="modifier-chain"),
+    ],
+)
+def test_one_marker_counts_once(text: str):
+    # The gate compares marker counts at base and head. A double count would hide a removed marker.
+    assert len(MARKER.findall(text)) == 1
 
 
 @pytest.mark.parametrize(
