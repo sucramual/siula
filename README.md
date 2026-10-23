@@ -6,6 +6,14 @@ Named after Siula Grande, inspired by a trek through the Huayhuash range.
 
 Siula's first slice inspects a declared delivery snapshot. It lists each action as `eligible`, `blocked`, or `completed`, gives block reasons, and reports unmet required criteria. It does not select or run an action. The host model remains the coordinator. The capability names `implement`, `verify`, `review`, and `publish` describe possible actions; this package does not implement them.
 
+## Install
+
+Install the `siula` command with [uv](https://docs.astral.sh/uv/). This puts `siula` on `PATH`:
+
+```sh
+uv tool install git+https://github.com/sucramual/siula
+```
+
 ## Run
 
 Use Python 3.12 or newer and [uv](https://docs.astral.sh/uv/).
@@ -43,9 +51,15 @@ A pull request review loop uses three helpers. Each refuses invalid input with a
 
 - `siula review-brief --diff-file D --intent-file I` prints the brief for a read-only reviewer: its instructions, the test-integrity checklist, the pull request description, and the diff. It treats the description and the diff as untrusted data, and it refuses an empty diff.
 - `siula check-findings F` checks the reviewer's JSON array of findings and prints it in normal form. Each finding has `severity`, `file`, `line`, and `body`. The severity must be `blocker`, `high`, `medium`, or `low`. These exact strings are a contract: an approval gate refuses on `blocker` or `high`.
-- `siula post-reply --repo OWNER/NAME --pr N (--thread COMMENT_ID | --issue) --body-file F` posts a reply through `gh`, the GitHub CLI. It always appends the footer `\n\n---\nagent on behalf of <handle>\n`, where the handle is the signed-in `gh` user. A review loop finds its own comments by this footer, so the bytes are a contract. This is the only helper that writes to GitHub. It posts only to the repository that `--repo` names.
+- `siula post-reply --repo OWNER/NAME --pr N (--thread COMMENT_ID | --issue) --body-file F` posts a reply through `gh`, the GitHub CLI. It always appends the footer `\n\n---\nagent on behalf of <handle>\n`, where the handle is the signed-in `gh` user. A review loop finds its own comments by this footer, so the bytes are a contract. It posts only to the repository that `--repo` names.
+
+`siula round <command> OWNER/NAME PR` keeps the round state of one pull request and tells the agent the next step. Its `post`, `push`, and `review` commands write to GitHub. [docs/review-loop.md](docs/review-loop.md) describes its design, invariants, and commands.
 
 `siula.review.test_integrity` gives `is_test_file` and `MARKER`, the static rules that find a test file and a `skip`, `only`, `xfail`, or similar marker.
+
+## Skills
+
+`siula-shepherd` is an agent skill that shepherds your own open pull request through received review feedback and required CI until it is stable. It never merges. It lives in `.agents/skills/siula-shepherd/`, and `.claude/skills` links to the same folder for Claude Code. The skill calls `siula round` on `PATH`, so install Siula first.
 
 ## Trust boundary
 
