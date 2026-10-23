@@ -35,7 +35,17 @@ The snapshot names one revision and environment. It includes an authority refere
 
 Evidence records a command, exit code, execution time, revision, environment, result, and kind. Test evidence also needs collected, executed, skipped, and approved skip counts. A test record passes only when it executed tests, the counts reconcile, and every skip is declared approved. Other evidence kinds do not carry test counts. Each required criterion names its expected evidence kind and evidence references. Completion needs at least one required criterion, and every required criterion must be resolved with current passing evidence. A successful action alone cannot complete the snapshot.
 
-The CLI reads one JSON file and writes a JSON report to standard output. Invalid input returns a structured JSON error on standard error and exit status 2. It never runs a command from the file, writes a checkpoint, contacts a service, or spawns a worker.
+`siula inspect` reads one JSON file and writes a JSON report to standard output. Invalid input returns a structured JSON error on standard error and exit status 2. It never runs a command from the file, writes a checkpoint, contacts a service, or spawns a worker.
+
+## Review helpers
+
+A pull request review loop uses three helpers. Each refuses invalid input with a JSON error on standard error and exit status 2. `post-reply` exits 1 when a GitHub call fails.
+
+- `siula review-brief --diff-file D --intent-file I` prints the brief for a read-only reviewer: its instructions, the test-integrity checklist, the pull request description, and the diff. It treats the description and the diff as untrusted data, and it refuses an empty diff.
+- `siula check-findings F` checks the reviewer's JSON array of findings and prints it in normal form. Each finding has `severity`, `file`, `line`, and `body`. The severity must be `blocker`, `high`, `medium`, or `low`. These exact strings are a contract: an approval gate refuses on `blocker` or `high`.
+- `siula post-reply --repo OWNER/NAME --pr N (--thread COMMENT_ID | --issue) --body-file F` posts a reply through `gh`, the GitHub CLI. It always appends the footer `\n\n---\nagent on behalf of <handle>\n`, where the handle is the signed-in `gh` user. A review loop finds its own comments by this footer, so the bytes are a contract. This is the only helper that writes to GitHub. It posts only to the repository that `--repo` names.
+
+`siula.review.test_integrity` gives `is_test_file` and `MARKER`, the static rules that find a test file and a `skip`, `only`, `xfail`, or similar marker.
 
 ## Trust boundary
 

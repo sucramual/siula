@@ -18,6 +18,9 @@ dev = ["pytest>=8,<10", "ruff>=0.11,<1", "mypy>=1.15,<2"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/siula"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
