@@ -103,8 +103,21 @@ def _post_reply(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    argv = sys.argv[1:]
+    if argv[:1] == ["round"]:
+        # The review-loop engine owns its command line, exit codes, and error format.
+        from siula.review import round as review_round
+
+        return review_round.main(argv[1:])
+
     parser = argparse.ArgumentParser(prog="siula")
     commands = parser.add_subparsers(dest="command", required=True)
+    # Listed for --help only: main() hands "siula round ..." to siula.review.round before parsing.
+    commands.add_parser(
+        "round",
+        help="keep the review-loop round state for one PR (siula round --help)",
+        add_help=False,
+    )
 
     inspect_parser = commands.add_parser("inspect", help="inspect a declared snapshot")
     inspect_parser.add_argument("snapshot", type=Path)
