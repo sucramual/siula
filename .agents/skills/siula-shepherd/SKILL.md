@@ -13,9 +13,9 @@ Resolve received feedback and attributable required CI failures on your own PR. 
 
 Use these defaults:
 
-- `--interval 30s`: how often `siula round sync` checks GitHub while it waits.
-- `--settle 20s`: after new feedback appears, wait this long with no more new feedback before `sync` returns. This keeps one review in one batch.
-- `--ceiling 300s`: longest wait inside one `sync` call.
+- `--interval 30`: how many seconds apart `siula round sync` checks GitHub while it waits.
+- `--settle 20`: after new feedback appears, wait this many seconds with no more new feedback before `sync` returns. This keeps one review in one batch.
+- `--ceiling 300`: longest wait, in seconds, inside one `sync` call.
 - `--max-rounds 8`: maximum triage rounds. Pass it to `siula round sync`.
 
 Stop immediately when asked to stop background review. Make no further edits or GitHub writes.
