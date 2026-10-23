@@ -107,7 +107,10 @@ SEVERITIES = ("blocker", "high", "medium", "low")
 REVIEW_EVENTS = ("APPROVE", "COMMENT", "REQUEST_CHANGES")
 BLOCKING_SEVERITIES = ("blocker", "high")  # a Fix at these levels stops APPROVE
 CHECK_KEY = r"check:[0-9a-f]{40}(?:[0-9a-f]{24})?:\S.*"  # check:<head sha>:<check name>
-ANY_KEY = re.compile(rf"(?:thread|review|issue|finding):[0-9]+|{CHECK_KEY}|ledger:L[1-9][0-9]*")
+# S2: <key>@<n> is the n-th text of an edited comment (n >= 2); the comment's key is its first.
+REVISION = r"@(?:[2-9]|[1-9][0-9]+)"
+COMMENT = rf"(?:thread|review|issue):[0-9]+(?:{REVISION})?"
+ANY_KEY = re.compile(rf"{COMMENT}|finding:[0-9]+|{CHECK_KEY}|ledger:L[1-9][0-9]*")
 LEDGER_ID = re.compile(r"L[1-9][0-9]*")
 STOP_ID = re.compile(r"stop-[1-9][0-9]*")
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")  # SHA-1, or SHA-256 repositories
@@ -116,9 +119,12 @@ PENDING_CONDITION = (
 )
 MAX_ROUNDS_CONDITION = "max rounds reached; raise the cap or stop"
 # An observed item; ANY_KEY adds ledger:L<n>.
-KEY = re.compile(rf"(?:thread|review|issue|finding):[0-9]+|{CHECK_KEY}")
+KEY = re.compile(rf"{COMMENT}|finding:[0-9]+|{CHECK_KEY}")
 COMMENT_KEY = re.compile(r"(thread|review|issue):([0-9]+)")  # the collector's numeric ids
+REVISED_KEY = re.compile(rf"((?:thread|review|issue):[0-9]+)({REVISION})?")  # comment, revision
 THREAD_KEY = re.compile(r"thread:[0-9]+")
+THREAD_SOURCE = re.compile(rf"(thread:[0-9]+)(?:{REVISION})?")  # a thread comment or a revision
+SHA256 = re.compile(r"[0-9a-f]{64}")
 NO_CHECKS_GRACE = 120  # seconds a head may show no checks before none counts as green
 CI_PENDING_LIMIT = 1800  # T4: seconds of wait_ci on one head before the run asks for input
 # T2: check runs that a bot review adds are review, not CI. They never set ciSeen, and they hold
@@ -241,6 +247,8 @@ STATE_SCHEMA = record(
                     "id": node(int, str),
                     "head": ident(SHA, NULL),
                     "source": closed("collector", "ci", "resume", "findings"),
+                    # S2: the hash of a comment's whole body; absent in older states
+                    "bodySha256": ident(SHA256, NULL),
                 }
             ),
         ),
@@ -292,7 +300,7 @@ STATE_SCHEMA = record(
                 "kind": closed("thread", "issue", "review"),
                 "target": ident(SHA, int),  # a comment id, or the head a review was sent for
                 "at": ident(TIME),
-                "bodySha256": ident(re.compile(r"[0-9a-f]{64}")),
+                "bodySha256": ident(SHA256),
                 "resumedAt": ident(TIME, NULL),
             },
             NULL,
@@ -321,6 +329,8 @@ STATE_SCHEMA = record(
                     "head": ident(SHA, NULL),
                     "source": closed("collector", "ci", "findings"),
                     "truncated": BOOL,  # Q4: the body was cut to BODY_LIMIT characters
+                    # S2: the hash of the whole body, so an edit after the cut is seen
+                    "bodySha256": ident(SHA256, NULL),
                 }
             ),
             "items.{key}",
@@ -712,6 +722,12 @@ def body_sha(text: str) -> str:
     return hashlib.sha256(text.replace("\r\n", "\n").strip().encode()).hexdigest()
 
 
+def thread_of(key: str) -> str | None:
+    """D3: the thread:<id> key that a source answers on: its own, or the comment it revises."""
+    match = THREAD_SOURCE.fullmatch(key)
+    return match[1] if match else None
+
+
 def record_reply(state: State, thread: str, reply_id: int) -> None:
     """D3: a reply receipt on every ledger entry that cites ``thread``.
 
@@ -719,7 +735,7 @@ def record_reply(state: State, thread: str, reply_id: int) -> None:
     """
     for entry in state["ledger"]:
         unpushed_fix = entry["disposition"] == "Fix" and entry.get("pushed") is None
-        if thread in entry["sources"] and not unpushed_fix:
+        if thread in map(thread_of, entry["sources"]) and not unpushed_fix:
             entry["replies"] = {**(entry.get("replies") or {}), thread: reply_id}
 
 
@@ -929,8 +945,57 @@ def comment_item(
 ) -> dict[str, Any]:
     if not is_int(source["id"]):
         raise TypeError("feedback id is not an integer")
-    readable = {"author": source["author"], "body": source["body"], "createdAt": created_at}
+    body = source["body"]
+    readable = {"author": source["author"], "body": body, "createdAt": created_at}
+    readable["bodySha256"] = body_sha(body if isinstance(body, str) else "")
     return new_item(kind, source["id"], head, "collector", **readable, **extra)
+
+
+def held_texts(state: State) -> dict[str, tuple[int, dict[str, Any]]]:
+    """S2: each comment that the run holds, as {comment key: (latest revision, its item)}.
+
+    The run holds a comment that sync returned: in the inbox until triage, then in the archive.
+    The run's own comments are handled but never held.
+    """
+    latest: dict[str, tuple[int, dict[str, Any]]] = {}
+    for item in [*state["items"].values(), *state["inbox"]]:
+        match = REVISED_KEY.fullmatch(item["key"])
+        number = int(match[2][1:]) if match and match[2] else 1
+        if match and number > latest.get(match[1], (0, {}))[0]:
+            latest[match[1]] = (number, item)
+    return latest
+
+
+def same_text(held: dict[str, Any], body: Any) -> bool:
+    """S2: whether ``body`` is the text of the held item.
+
+    It compares bodySha256, the hash of the whole body. An item from before that field compares
+    its stored text, cut like the archive when the archive cut it (Q4).
+    """
+    text = body if isinstance(body, str) else ""
+    if held.get("bodySha256") is not None:
+        return bool(held["bodySha256"] == body_sha(text))
+    stored = held.get("body")
+    if held.get("truncated"):
+        text = text[:BODY_LIMIT]
+    return body_sha(stored if isinstance(stored, str) else "") == body_sha(text)
+
+
+def revision(
+    held: dict[str, tuple[int, dict[str, Any]]], item: dict[str, Any]
+) -> dict[str, Any] | None:
+    """S2: a new revision item when an observed comment no longer has its latest held text.
+
+    GitHub keeps a comment's id when someone edits it, so sync compares the body. The item is
+    <key>@<n+1>, after the latest revision n, and names that revision in ``revises``. A comment
+    that the run does not hold, an unchanged body, a check, and a finding give None.
+    """
+    if item["kind"] not in ("thread", "review", "issue") or item["key"] not in held:
+        return None
+    number, latest = held[item["key"]]
+    if same_text(latest, item.get("body")):
+        return None
+    return {**item, "key": f"{item['key']}@{number + 1}", "revises": latest["key"]}
 
 
 def check_item(head: str, name: str) -> dict[str, Any]:
@@ -1203,9 +1268,13 @@ def awaiting(state: State, response: str) -> list[dict[str, Any]]:
 
 
 def unreplied(entry: dict[str, Any]) -> list[str]:
-    """D3: the threads that a pushed Fix cites and that have no reply receipt yet."""
+    """D3: the threads that a pushed Fix cites and that have no reply receipt yet.
+
+    A cited revision (thread:<id>@<n>) asks for the reply on thread:<id>.
+    """
     replies = entry.get("replies") or {}
-    return [key for key in entry["sources"] if THREAD_KEY.fullmatch(key) and key not in replies]
+    threads = dict.fromkeys(key for key in map(thread_of, entry["sources"]) if key)
+    return [key for key in threads if key not in replies]
 
 
 def open_decisions(state: State) -> list[dict[str, Any]]:
@@ -1310,9 +1379,15 @@ def cmd_sync(args: argparse.Namespace, store: Store) -> dict[str, Any]:
     # taken in.
     failing = [] if head_changed else ci["failing"]
     observed = feedback(snapshot, state["head"]) + [check_item(head, name) for name in failing]
-    fresh = [
-        entry for entry in observed if entry["key"] not in handled and entry["key"] not in in_inbox
-    ]
+    # S2: a known comment comes back only as a revision, when its body changed since the latest
+    # text the run holds.
+    held = held_texts(state)
+    fresh = []
+    for entry in observed:
+        if entry["key"] not in handled and entry["key"] not in in_inbox:
+            fresh.append(entry)
+        elif (revised := revision(held, entry)) is not None:
+            fresh.append(revised)
     gaps = []
     if reviewer and reviewer.get("timedOut"):
         gaps.append(f"{reviewer.get('login')} did not review {head[:7]}")

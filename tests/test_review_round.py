@@ -51,7 +51,7 @@ from typing import Any
 
 import pytest
 from conftest import SIULA, IsolatedEnv
-from review_snapshot import comment, next_id, pr_snapshot, reaction_node, thread
+from review_snapshot import comment, next_id, pr_snapshot, reaction_node, review_node, thread
 
 TESTS = Path(__file__).resolve().parent
 REPO = "octo-org/hello-world"
@@ -427,6 +427,25 @@ class Round:
         with self.pr_data() as pr:
             new_id = next_id(pr)
             pr["comments"]["nodes"].append(comment(new_id, body, author, self.now))
+        return new_id
+
+    def edit_comment(self, database_id: int, body: str) -> None:
+        """Edit a thread comment, review, or issue comment in place; GitHub keeps its id."""
+        with self.pr_data() as pr:
+            nodes = [c for t in pr["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]]
+            nodes += pr["reviews"]["nodes"] + pr["comments"]["nodes"]
+            (node,) = [node for node in nodes if node["databaseId"] == database_id]
+            node["body"] = body
+
+    def add_review(self, body: str, author: str = "monalisa") -> int:
+        """A COMMENTED review with a body on the current head, at the current time. Returns its
+        id.
+        """
+        with self.pr_data() as pr:
+            new_id = next_id(pr)
+            pr["reviews"]["nodes"].append(
+                review_node(new_id, pr["headRefOid"], author, body, self.now)
+            )
         return new_id
 
     def react(self, content: str = "THUMBS_UP") -> None:
@@ -1026,6 +1045,221 @@ def test_S2_a_long_body_is_archived_cut_to_8000_characters(make):
         exact_id: ("z" * 8000, False),
         short_id: ("P2: short", False),
     }
+
+
+# A finding that a reviewer adds to a comment by editing it; GitHub keeps the comment's id.
+EDITED = "P1: the cursor also skips the last page; guard it too."
+THREAD_ID, ISSUE_ID, STATUS_ID = 4237011925, 6095816171, 6095746489
+
+
+@pytest.mark.parametrize("kind", ["thread", "issue", "review"])
+def test_S2_an_edited_comment_returns_to_triage_as_a_revision(make, kind: str):
+    """S2 (Q1): sync compares each comment's body with the latest text the run holds for it. A
+    changed body enters the inbox as <key>@<n>, triage covers it, and the archive keeps every text
+    under its own key. A body that did not change adds nothing.
+
+    Bug (Codex review of #4): sync dropped every observed key that was handled or in the inbox, so
+    a finding that a reviewer added by an edit never reached triage, and a covered head with green
+    CI went to done.
+    """
+    h = make(COVERED)
+    ids = {"thread": THREAD_ID, "issue": ISSUE_ID}
+    if kind == "review":
+        ids["review"] = h.add_review("Please guard the empty cursor.")
+    h.ok("sync")
+    h.noise()
+    key = f"{kind}:{ids[kind]}"
+    first_text = h.state()["items"][key]["body"]
+    edited_text = f"{first_text}\n\n{EDITED}"
+    h.advance(60)
+    h.edit_comment(ids[kind], edited_text)
+
+    edited = h.ok("sync", "--ceiling", "60")
+
+    assert ([item["key"] for item in edited["newItems"]], edited["next"]) == (
+        [f"{key}@2"],
+        "triage",
+    ), edited
+    assert (edited["ci"]["state"], edited["reviewer"]["state"]) == ("green", "covered"), (
+        "every gate holds, so only the revision keeps the run from done"
+    )
+    revision = edited["newItems"][0]
+    assert (revision["kind"], revision["id"], revision["body"]) == (kind, ids[kind], edited_text)
+    assert revision["revises"] == key
+    claim = {**NOT_FIXED, "claim": "The last page is already guarded", "sources": [f"{key}@2"]}
+    h.triage([claim])
+    items = h.state()["items"]
+    assert (items[key]["body"], items[f"{key}@2"]["body"]) == (first_text, edited_text), (
+        "the archive keeps both texts under their own keys"
+    )
+    unchanged = h.ok("sync", "--ceiling", "60")
+    assert (unchanged["newItems"], unchanged["next"]) == ([], "done"), (
+        "an unchanged body adds nothing"
+    )
+    h.advance(60)
+    h.edit_comment(ids[kind], first_text)  # back to the first text: new against the latest one
+    reverted = h.ok("sync", "--ceiling", "60")
+    assert [item["key"] for item in reverted["newItems"]] == [f"{key}@3"], reverted
+    assert h.state()["items"][key]["body"] == first_text, "the first archive entry never changes"
+
+
+def test_S2_a_comment_edited_while_its_item_waits_in_the_inbox_is_triaged_in_both_texts(make):
+    """S2 (Q1): an edit while the item waits in the inbox adds <key>@2 next to it. Triage must
+    cover both keys, and the archive keeps the text that each one had.
+
+    Bug: the inbox kept the text from the first sync, so triage never saw the edit, and the
+    archive stored the old text as if it were the whole comment.
+    """
+    h = make(COVERED)
+    first = h.ok("sync")
+    first_keys = [item["key"] for item in first["newItems"]]
+    key = f"thread:{THREAD_ID}"
+    old = next(item for item in first["newItems"] if item["key"] == key)["body"]
+    new = f"{old}\n\n{EDITED}"
+    h.advance(60)
+    h.edit_comment(THREAD_ID, new)
+
+    second = h.ok("sync", "--ceiling", "60")
+
+    assert [item["key"] for item in second["newItems"]] == [*first_keys, f"{key}@2"], second
+    assert second["newItems"][-1]["body"] == new
+    assert next(item for item in second["newItems"] if item["key"] == key)["body"] == old
+    error = f"triage leaves inbox keys uncovered: ['{key}@2']"
+    h.refused(error, "triage", "--file", h.write("t.json", json.dumps(noise_for(first_keys))))
+    h.noise()
+    items = h.state()["items"]
+    assert (items[key]["body"], items[f"{key}@2"]["body"]) == (old, new)
+
+
+def test_D3_a_fix_that_cites_a_thread_revision_waits_for_a_reply_on_its_thread(make):
+    """D3: a revision of a thread comment belongs to its thread. A pushed Fix that cites
+    thread:<id>@<n> needs a reply receipt on thread:<id>, and post --thread <id> records it.
+
+    Bug: the reply check matched only thread:<id> keys, so a Fix that cited a revision reached
+    done with no reply on the reviewer's thread; or post --thread <id> recorded no receipt on it.
+    """
+    h = make(COVERED)
+    work = h.synced_branch()
+    h.advance(60)
+    h.edit_comment(THREAD_ID, EDITED)
+    revised = h.ok("sync", "--ceiling", "60")
+    assert [item["key"] for item in revised["newItems"]] == [f"thread:{THREAD_ID}@2"], revised
+    h.triage([{**FIX, "sources": [f"thread:{THREAD_ID}@2"]}])
+    new_head = h.commit(work, "fix: guard the last page")
+    h.ok("push", cwd=work)
+    h.set_head(new_head)
+    h.react()
+
+    unreplied = h.ok("sync")
+    reply = h.post("--thread", str(THREAD_ID), body=f"Fixed in {new_head[:7]}.")
+    done = h.ok("sync")
+
+    assert (unreplied["next"], unreplied["reason"]) == ("triage", "unreplied fix L6"), unreplied
+    assert reply.returncode == 0, reply.stderr
+    entry = h.state()["ledger"][-1]
+    reply_id = json.loads(reply.stdout)["commentId"]
+    assert (entry["id"], entry["sources"], entry.get("replies")) == (
+        "L6",
+        [f"thread:{THREAD_ID}@2"],
+        {f"thread:{THREAD_ID}": reply_id},
+    )
+    assert done["next"] == "done", done
+
+
+def test_S2_codexs_edited_status_comment_is_a_revision_that_noise_settles(make):
+    """S2: Codex edits its status comment in place on each review. The edit is a revision that
+    triage lists as noise, and the run then reaches done.
+
+    Bug: the edit was dropped (a finding added that way never reached triage), or a noise revision
+    stopped the run.
+    """
+    h = synced(make, COVERED)
+    h.advance(60)
+    status = "<!-- codex-pull-request-review-summary -->\nCodex reviewed the latest commit."
+    h.edit_comment(STATUS_ID, status)
+
+    edited = h.ok("sync", "--ceiling", "60")
+
+    assert ([item["key"] for item in edited["newItems"]], edited["next"]) == (
+        [f"issue:{STATUS_ID}@2"],
+        "triage",
+    ), edited
+    h.noise()
+    done = h.ok("sync", "--ceiling", "60")
+    assert (done["newItems"], done["next"]) == ([], "done"), done
+    state = h.state()
+    assert (state["status"], state["target"]) == ("succeeded", "ready_for_human_merge")
+    assert state["ledger"][-1]["disposition"] == "Noise"
+
+
+def test_S2_an_edit_to_the_runs_own_comment_adds_no_revision(make):
+    """S2: the run's own comments stay out of triage, edited or not; post marks them handled and
+    sync never archives them.
+
+    Bug: a revision check that treated every handled key as triaged feedback returned the run's
+    own comment to triage after an edit.
+    """
+    h = synced(make, COVERED)
+    posted = h.post("--issue", body="Round 1: nothing to fix.")
+    assert posted.returncode == 0, posted.stderr
+    own = json.loads(posted.stdout)["commentId"]
+    h.advance(60)
+    h.edit_comment(own, "Round 1: nothing to fix, as the owner edited it.")
+
+    after = h.ok("sync", "--ceiling", "60")
+
+    assert f"issue:{own}" in h.state()["handled"], "the own comment is handled"
+    assert (after["newItems"], after["next"]) == ([], "done"), after
+
+
+@pytest.mark.parametrize("edit", ["unchanged", "edited-after-the-cut"])
+def test_S2_a_long_body_is_compared_in_full_not_by_its_archived_cut(make, edit: str):
+    """S2 (Q4): the archive keeps 8,000 characters of a body, so sync compares the hash of the
+    whole body (bodySha256), not the cut text.
+
+    Bugs: an unchanged long body looked edited on every sync, because the full text never equals
+    the cut; or an edit after character 8,000 was missed.
+    """
+    h = make(COVERED)
+    long_id = h.add_comment("x" * 8999 + "y")
+    h.ok("sync")
+    h.noise()
+    assert h.state()["items"][f"issue:{long_id}"]["truncated"] is True
+    h.advance(60)
+    if edit == "edited-after-the-cut":
+        h.edit_comment(long_id, "x" * 8999 + "z")
+
+    after = h.ok("sync", "--ceiling", "60")
+
+    expected = [f"issue:{long_id}@2"] if edit == "edited-after-the-cut" else []
+    assert [item["key"] for item in after["newItems"]] == expected, after
+
+
+@pytest.mark.parametrize("case", ["unchanged-short", "edited-short", "unchanged-long"])
+def test_S2_an_archive_from_before_body_hashes_still_loads_and_compares_its_text(make, case: str):
+    """S2: a state file written before bodySha256 existed loads; sync then compares the archived
+    text, cut the same way when the archive was cut.
+
+    Bug: an archive entry without a hash failed to load, or every unchanged long body looked
+    edited.
+    """
+    h = make(COVERED)
+    long_id = h.add_comment("x" * 8999 + "y")
+    h.ok("sync")
+    h.noise()
+    old = h.state()
+    for item in old["items"].values():
+        del item["bodySha256"]
+    h.state_file.write_text(json.dumps(old))
+    h.advance(60)
+    if case == "edited-short":
+        h.edit_comment(THREAD_ID, EDITED)
+
+    after = h.ok("sync", "--ceiling", "60")
+
+    expected = [f"thread:{THREAD_ID}@2"] if case == "edited-short" else []
+    assert [item["key"] for item in after["newItems"]] == expected, after
+    assert h.state()["items"][f"issue:{long_id}"]["truncated"] is True
 
 
 @pytest.mark.parametrize(
@@ -2716,6 +2950,7 @@ def full_state(h: Round) -> dict:
         "head": head,
         "source": "collector",
         "body": "b",
+        "bodySha256": "0" * 64,
     }
     entry = {
         "id": "L1",
@@ -2781,6 +3016,7 @@ SCHEMA_TABLE = [
     (("skillSha",), "skillSha", NOT_TEXT),
     (("handled",), "handled", NOT_LIST),
     (("handled", 0), "handled[0]", NOT_ID),
+    (("handled", 0), "handled[0]", ("thread:11@1", "thread:11@02", "finding:3@2")),
     (("inbox",), "inbox", NOT_LIST),
     (("inbox", 0), "inbox[0]", NOT_RECORD),
     (("inbox", 0, "key"), "inbox[0].key", NOT_ID),
@@ -2788,6 +3024,7 @@ SCHEMA_TABLE = [
     (("inbox", 0, "id"), "inbox[0].id", (True, None, [], {}, 1.5)),
     (("inbox", 0, "head"), "inbox[0].head", NOT_ID_OR_NULL),
     (("inbox", 0, "source"), "inbox[0].source", NOT_CLOSED),
+    (("inbox", 0, "bodySha256"), "inbox[0].bodySha256", NOT_ID_OR_NULL),
     (("head",), "head", NOT_ID_OR_NULL),
     (("heads",), "heads", NOT_MAP),
     (("heads", "HEAD"), "heads.HEAD", NOT_RECORD),
@@ -2844,6 +3081,7 @@ SCHEMA_TABLE = [
     (("items", "thread:11", "head"), "items.thread:11.head", NOT_ID_OR_NULL),
     (("items", "thread:11", "source"), "items.thread:11.source", (*NOT_CLOSED, "resume")),
     (("items", "thread:11", "truncated"), "items.thread:11.truncated", NOT_BOOL),
+    (("items", "thread:11", "bodySha256"), "items.thread:11.bodySha256", NOT_ID_OR_NULL),
     (("proposals",), "proposals", NOT_MAP),
     (("proposals", "P1"), "proposals.P1", NOT_RECORD),
     (("proposals", "P1", "round"), "proposals.P1.round", NOT_INT),
